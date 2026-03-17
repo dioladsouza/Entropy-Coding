@@ -5,9 +5,9 @@ Encodes image pixel data using Golomb-Rice coding.
 
 Pipeline:
   1. Load image as grayscale pixel array
-  2. Compute residuals (delta encoding)
+  2. Compute 2D residuals using MED predictor (JPEG-LS style)
   3. Map residuals to non-negative integers (zigzag mapping)
-  4. Choose optimal Rice parameter k from data statistics
+  4. Choose optimal Rice parameter k per row from data statistics
   5. Encode each value: unary(quotient) + k-bit binary(remainder)
   6. Decode and reconstruct the original image
   7. Evaluate: compression ratio, encode/decode time, memory
@@ -16,7 +16,6 @@ Pipeline:
 import time
 import tracemalloc
 import math
-import struct
 import numpy as np
 from PIL import Image
 
@@ -37,137 +36,215 @@ def zigzag_decode(value: int) -> int:
 
 # ─────────────────────────────────────────────
 # STEP 2: Choose optimal Rice parameter k
-#   k = max(0, floor(log2(log2(mean + 1))))
+#   Standard formula used in FLAC:
+#   k = round(log2(mean)), clamped to [0, 8]
+#   Much more accurate than the log2(log2()) heuristic
+#   for natural images with larger residuals.
 # ─────────────────────────────────────────────
 
-def optimal_k(values: list[int]) -> int:
+def optimal_k(values: list) -> int:
     """Estimate the best Rice parameter k from the data mean."""
-    mean = sum(values) / len(values) if values else 1
+    if not values:
+        return 0
+    mean = sum(values) / len(values)
     if mean <= 1:
         return 0
-    inner = math.log2(mean + 1)
-    if inner <= 1:
-        return 0
-    return max(0, int(math.floor(math.log2(inner))))
+    return max(0, min(8, round(math.log2(mean))))
 
 
 # ─────────────────────────────────────────────
-# STEP 3: Golomb-Rice encode a single integer
-#   Given n and k:
-#     q = n >> k          (floor division by 2^k)
-#     r = n & (2^k - 1)   (remainder, lower k bits)
-#   Output: unary(q) followed by k-bit binary(r)
+# STEP 3: 2D MED predictor (LOCO-I / JPEG-LS)
+#   Uses left, above, and above-left neighbours
+#   to predict each pixel. Much better than 1D
+#   left-only delta for natural images because it
+#   exploits both horizontal and vertical correlation.
+#
+#   MED rule:
+#     if above-left >= max(left, above): predict = min(left, above)
+#     if above-left <= min(left, above): predict = max(left, above)
+#     else:                              predict = left + above - above-left
+# ─────────────────────────────────────────────
+
+def med_predict(a: int, b: int, c: int) -> int:
+    """LOCO-I MED predictor.
+    a = left, b = above, c = above-left
+    """
+    if c >= max(a, b):
+        return min(a, b)
+    elif c <= min(a, b):
+        return max(a, b)
+    else:
+        return a + b - c
+
+
+def compute_residuals_2d(pixels: list, width: int, height: int) -> list:
+    """
+    Compute prediction residuals using the 2D MED predictor.
+    Scans left-to-right, top-to-bottom.
+
+    Edge cases:
+      - Top-left pixel: predict 128 (mid-grey DC offset)
+      - Top row (y=0, x>0): predict from left neighbour only
+      - Left column (x=0, y>0): predict from above neighbour only
+      - All other pixels: use full MED predictor
+    """
+    residuals = []
+    for y in range(height):
+        for x in range(width):
+            idx = y * width + x
+            if x == 0 and y == 0:
+                pred = 128
+            elif y == 0:
+                pred = pixels[idx - 1]           # top row: left only
+            elif x == 0:
+                pred = pixels[idx - width]       # left col: above only
+            else:
+                a = pixels[idx - 1]              # left
+                b = pixels[idx - width]          # above
+                c = pixels[idx - width - 1]      # above-left
+                pred = med_predict(a, b, c)
+            residuals.append(pixels[idx] - pred)
+    return residuals
+
+
+def reconstruct_pixels_2d(residuals: list, width: int, height: int) -> list:
+    """
+    Reverse the 2D MED prediction — must mirror compute_residuals_2d exactly.
+    Reconstructs pixels in the same scan order using already-decoded neighbours.
+    """
+    pixels = [0] * (width * height)
+    for y in range(height):
+        for x in range(width):
+            idx = y * width + x
+            if x == 0 and y == 0:
+                pred = 128
+            elif y == 0:
+                pred = pixels[idx - 1]
+            elif x == 0:
+                pred = pixels[idx - width]
+            else:
+                a = pixels[idx - 1]
+                b = pixels[idx - width]
+                c = pixels[idx - width - 1]
+                pred = med_predict(a, b, c)
+            pixels[idx] = residuals[idx] + pred
+    return pixels
+
+
+# ─────────────────────────────────────────────
+# STEP 4: Golomb-Rice encode / decode one value
 # ─────────────────────────────────────────────
 
 def rice_encode_value(n: int, k: int) -> str:
     """Encode a non-negative integer n with Rice parameter k.
     Returns a bit-string like '11010'.
     """
-    q = n >> k              # quotient
-    r = n & ((1 << k) - 1) # remainder (lower k bits)
-
-    unary = '1' * q + '0'                         # q ones then a zero
-    binary = format(r, f'0{k}b') if k > 0 else '' # k-bit binary remainder
+    q = n >> k               # quotient
+    r = n & ((1 << k) - 1)  # remainder (lower k bits)
+    unary  = '1' * q + '0'
+    binary = format(r, f'0{k}b') if k > 0 else ''
     return unary + binary
 
 
-def rice_decode_value(bits: str, pos: int, k: int) -> tuple[int, int]:
-    """Decode one Rice-coded value starting at position pos in the bitstring.
+def rice_decode_value(bits: str, pos: int, k: int) -> tuple:
+    """Decode one Rice-coded value starting at position pos.
     Returns (decoded_value, new_position).
     """
-    # Read unary: count 1s until we hit a 0
     q = 0
     while pos < len(bits) and bits[pos] == '1':
         q += 1
         pos += 1
-    pos += 1  # skip the terminating '0'
-
-    # Read k-bit remainder
+    pos += 1  # skip terminating '0'
     r = int(bits[pos:pos + k], 2) if k > 0 else 0
     pos += k
-
     return (q << k) | r, pos
 
 
 # ─────────────────────────────────────────────
-# STEP 4: Encode an entire image
+# STEP 5: Encode an entire image
+#   - 2D MED residuals
+#   - Per-row adaptive k selection
+#   - k_values stored alongside bitstream for decoder
 # ─────────────────────────────────────────────
 
 def encode_image(image_path: str) -> dict:
     """
     Full Golomb-Rice encoding pipeline for a grayscale image.
-    Returns a dict with bitstream, k, shape, and stats.
+    Uses 2D MED predictor and per-row adaptive k selection.
+    Returns a dict with bitstream, k_values, shape, and stats.
     """
-    # Load image
-    img = Image.open(image_path).convert('L')  # grayscale
-    pixels = list(img.tobytes())
-    height, width = img.size[1], img.size[0]
+    img    = Image.open(image_path).convert('L')
+    pixels = [int(p) for p in img.tobytes()]
+    width, height = img.size
 
-    # Delta (residual) encoding: predict each pixel from the previous one.
-    # Cast to int to allow signed differences before zigzag mapping.
-    pixels = [int(p) for p in pixels]
-    residuals = [pixels[0]]  # first pixel stored as-is
-    for i in range(1, len(pixels)):
-        residuals.append(pixels[i] - pixels[i - 1])
+    # 2D residuals + zigzag mapping
+    residuals = compute_residuals_2d(pixels, width, height)
+    mapped    = [zigzag_encode(r) for r in residuals]
 
-    # Zigzag-map residuals to non-negative integers
-    mapped = [zigzag_encode(r) for r in residuals]
+    # Per-row k selection and encoding
+    bitstream_parts = []
+    k_values        = []
 
-    # Choose Rice parameter k
-    k = optimal_k(mapped)
+    for row in range(height):
+        row_vals = mapped[row * width : (row + 1) * width]
+        k        = optimal_k(row_vals)
+        k_values.append(k)
+        for v in row_vals:
+            bitstream_parts.append(rice_encode_value(v, k))
 
-    # Encode each value
-    bitstream = ''.join(rice_encode_value(v, k) for v in mapped)
+    bitstream = ''.join(bitstream_parts)
 
-    original_bits = len(pixels) * 8  # 8 bits per pixel (uint8)
+    original_bits   = len(pixels) * 8
     compressed_bits = len(bitstream)
 
     return {
-        'bitstream': bitstream,
-        'k': k,
-        'width': width,
-        'height': height,
-        'original_bits': original_bits,
-        'compressed_bits': compressed_bits,
-        'compression_ratio': original_bits / compressed_bits,
-        'num_pixels': len(pixels),
+        'bitstream'        : bitstream,
+        'k_values'         : k_values,   # one k per row — needed by decoder
+        'k'                : k_values[-1] if k_values else 0,  # for display
+        'width'            : width,
+        'height'           : height,
+        'original_bits'    : original_bits,
+        'compressed_bits'  : compressed_bits,
+        'compression_ratio': original_bits / compressed_bits if compressed_bits else 0,
+        'num_pixels'       : len(pixels),
     }
 
 
 # ─────────────────────────────────────────────
-# STEP 5: Decode back to pixels
+# STEP 6: Decode back to pixels
 # ─────────────────────────────────────────────
 
-def decode_image(result: dict) -> list[int]:
+def decode_image(result: dict) -> list:
     """
     Decode a Golomb-Rice encoded bitstream back to pixel values.
+    Uses per-row k_values to mirror the adaptive encoder.
     Returns a flat list of uint8 pixel values.
     """
-    bitstream = result['bitstream']
-    k = result['k']
-    num_pixels = result['num_pixels']
+    bitstream  = result['bitstream']
+    k_values   = result['k_values']
+    width      = result['width']
+    height     = result['height']
 
-    pos = 0
+    pos    = 0
     mapped = []
-    for _ in range(num_pixels):
-        val, pos = rice_decode_value(bitstream, pos, k)
-        mapped.append(val)
 
-    # Reverse zigzag mapping
+    for row in range(height):
+        k = k_values[row]
+        for _ in range(width):
+            val, pos = rice_decode_value(bitstream, pos, k)
+            mapped.append(val)
+
+    # Reverse zigzag
     residuals = [zigzag_decode(v) for v in mapped]
 
-    # Reverse delta encoding
-    pixels = [residuals[0]]
-    for i in range(1, len(residuals)):
-        pixels.append(pixels[-1] + residuals[i])
+    # Reverse 2D MED prediction
+    pixels = reconstruct_pixels_2d(residuals, width, height)
 
-    # Clamp to valid uint8 range
-    pixels = [max(0, min(255, p)) for p in pixels]
-    return pixels
+    return [max(0, min(255, p)) for p in pixels]
 
 
 # ─────────────────────────────────────────────
-# STEP 6: Evaluate and print results
+# STEP 7: Evaluate and print results
 # ─────────────────────────────────────────────
 
 def evaluate(image_path: str):
@@ -175,40 +252,41 @@ def evaluate(image_path: str):
     print(f"  Golomb-Rice Coder — {image_path}")
     print(f"{'='*52}")
 
-    # ── Encoding ──
     tracemalloc.start()
-    t0 = time.perf_counter()
+    t0     = time.perf_counter()
     result = encode_image(image_path)
     encode_time = time.perf_counter() - t0
     _, encode_peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    # ── Decoding ──
     tracemalloc.start()
-    t1 = time.perf_counter()
+    t1             = time.perf_counter()
     decoded_pixels = decode_image(result)
-    decode_time = time.perf_counter() - t1
+    decode_time    = time.perf_counter() - t1
     _, decode_peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    # ── Verify lossless reconstruction ──
-    img = Image.open(image_path).convert('L')
+    img             = Image.open(image_path).convert('L')
     original_pixels = list(img.tobytes())
-    lossless = (decoded_pixels == original_pixels)
+    lossless        = (decoded_pixels == original_pixels)
 
-    # ── Save reconstructed image ──
     out_img = Image.new('L', (result['width'], result['height']))
     out_img.putdata(decoded_pixels)
     out_path = image_path.replace('.', '_decoded.')
     out_img.save(out_path)
 
-    # ── Print report ──
+    cr     = result['compression_ratio']
+    k_vals = result['k_values']
+
     print(f"  Image size        : {result['width']} x {result['height']} px")
-    print(f"  Rice parameter k  : {result['k']}")
+    print(f"  Rice parameter k  : {min(k_vals)}–{max(k_vals)} (per-row adaptive)")
     print(f"  Original size     : {result['original_bits'] // 8:,} bytes")
     print(f"  Compressed size   : {result['compressed_bits'] // 8:,} bytes")
-    print(f"  Compression ratio : {result['compression_ratio']:.3f}x")
-    print(f"  Space saving      : {(1 - 1/result['compression_ratio'])*100:.1f}%")
+    print(f"  Compression ratio : {cr:.3f}x")
+    if cr > 1:
+        print(f"  Space saving      : {(1 - 1/cr)*100:.1f}%")
+    else:
+        print(f"  Space saving      : {(1 - 1/cr)*100:.1f}% (expansion)")
     print(f"  Encode time       : {encode_time*1000:.2f} ms")
     print(f"  Decode time       : {decode_time*1000:.2f} ms")
     print(f"  Encode memory     : {encode_peak / 1024:.1f} KB")
@@ -221,8 +299,7 @@ def evaluate(image_path: str):
 
 
 # ─────────────────────────────────────────────
-# STEP 7: Generate a synthetic test image
-#   (in case you don't have a test image handy)
+# STEP 8: Generate synthetic test images
 # ─────────────────────────────────────────────
 
 def generate_test_image(path: str = 'test_image.png', size: int = 256):
@@ -245,10 +322,8 @@ if __name__ == '__main__':
     import os
 
     if len(sys.argv) > 1:
-        # Use provided image path
         image_path = sys.argv[1]
     else:
-        # Generate a synthetic test image
         image_path = '/tmp/test_image.png'
         generate_test_image(image_path)
 
